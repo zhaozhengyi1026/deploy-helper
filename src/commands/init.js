@@ -164,10 +164,19 @@ export async function deployInit() {
     {
       type: 'list',
       name: 'authType',
-      message: '登录方式：',
+      message: '登录方式（上下键选择）：',
+      default: sshDefaults.user !== 'root' ? 'password' : 'key',
       choices: [
-        { name: 'SSH 密钥（推荐）', value: 'key' },
-        { name: '密码', value: 'password' },
+        {
+          name: '密码',
+          value: 'password',
+          description: '输入用户名对应的登录密码（云平台如 Featurize、AutoDL、阿里云等通常用这种）',
+        },
+        {
+          name: 'SSH 密钥',
+          value: 'key',
+          description: '使用本地 ~/.ssh/id_rsa 等私钥文件（自建 VPS 且已配置密钥登录时选这种）',
+        },
       ],
     },
     {
