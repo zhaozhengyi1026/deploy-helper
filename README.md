@@ -21,28 +21,29 @@ npm i -g @zhengyizhao/deploy-helper
 deploy-helper init
 ```
 
+Project website source is in `website/`. Contributors can preview it locally with `npm run site:preview` and open `http://127.0.0.1:4173`.
+
 ---
 
 ## How It Works
 
-**Web service** (5 steps):
+Before the wizard begins, deploy-helper identifies Windows, macOS, or Linux, then checks Git and SSH with platform-specific installation guidance. An optional passwordless SSH step is offered before deployment.
+
+**Web service** (7 guided stages):
 
 ```
-[1/5] Server credentials    → Enter IP, SSH key/password, connection tested immediately
-[2/5] Project info          → Auto-detect type, version, start command — confirm each
-[3/5] Domain & HTTPS        → Optional, auto-issue Let's Encrypt certificate
-[4/5] Install server env    → Install dependencies as needed, skip if already installed
-[5/5] Upload & start        → Upload → start process → configure Nginx → health check
+[1/7] Connect server        → Enter IP, SSH port, user and password/key
+[2/7] Confirm project       → Detect type, runtime, application port and start command
+[3/7] Source & environment  → Upload or Git pull; answer .env.example variables one by one
+[4/7] Domain & HTTPS        → Optional; no domain skips Nginx and certificates
+[5/7] Install server env    → Git, Docker/Compose, runtime and optional web tools
+[6/7] Build & start         → Install dependencies, build images and start services
+[7/7] Configure & verify    → Optional Nginx/HTTPS, process check and HTTP check
 ```
 
-**Background script / cron job** (4 steps, skips domain and Nginx):
+Every executable stage asks for confirmation. Correctable errors can return to the previous input, temporary network failures can retry, and failed automatic installs show manual repair commands. Progress is written after each stage to `.deploy-progress.json`; passwords, tokens and environment values are excluded. Ctrl+C, `exit`, terminal closure and power loss can therefore resume from the last saved stage.
 
-```
-[1/4] Server credentials
-[2/4] Project info (including run mode selection)
-[3/4] Install server env
-[4/4] Upload & start
-```
+**Background scripts / cron jobs** use the same flow; domain, Nginx and HTTPS are explicitly skipped.
 
 After deployment:
 
@@ -96,19 +97,20 @@ Choose one during `init`. This determines process management and whether Nginx i
 Auto-detects: `.nvmrc` / `.node-version` / `package.json engines.node` → Node.js version; `package.json scripts.start` / common entry files → start command.
 
 - Process manager: **PM2** (auto-restart, starts on boot)
-- Works with `npm start`, `node server.js`, `next start`, and everything else
-- **Script mode**: PM2 with `--no-autorestart` — won't restart after a clean exit
+- Uses npm-aware startup commands, so local binaries such as Next.js and Nuxt resolve correctly
+- Runs `npm run build` when detected, then prunes build-only dependencies
+- **Script mode**: PM2 restarts crashes but does not restart a process that exits cleanly
 - **Cron mode**: writes to crontab, logs to `/var/log/<appname>.log`
 
 ### Python
 
-Auto-detects: `.python-version` / `pyproject.toml` → Python version; `requirements.txt` → framework (FastAPI / Django / Flask) → recommended start command; `environment.yml` / `conda-lock.yml` → conda mode.
+Auto-detects: `.python-version` / `pyproject.toml` → Python version; `requirements.txt` / `pyproject.toml` → framework (FastAPI / Django / Flask) → recommended start command; `environment.yml` / `conda-lock.yml` → conda mode.
 
 Process manager: **supervisor** (auto-restart, starts on boot, logs to `/var/log/<appname>.out.log` + `.err.log`)
 
-**pip mode** (has `requirements.txt`)
+**pip mode** (has `requirements.txt` or `pyproject.toml`)
 - Installs Python automatically if missing (deadsnakes PPA, supports 3.8–3.13), skips if already installed
-- Creates a virtualenv — all packages isolated inside `venv/`, nothing written to the system
+- Creates a virtualenv and installs from `requirements.txt` or the local `pyproject.toml` project
 - FastAPI → uvicorn; Django / Flask → gunicorn
 - **Script mode**: supervisor `autorestart=unexpected` — only restarts on crash, not on clean exit
 - **Cron mode**: writes to crontab, runs using the venv Python
@@ -149,7 +151,7 @@ Two deploy modes:
 
 ### Static Sites
 
-Plain HTML / CSS / JS, served directly by Nginx. Gzip and SPA fallback routing are configured automatically. Build output in `dist/` is uploaded normally (not skipped).
+Plain HTML / CSS / JS, served directly by Nginx. For Vite/React-style projects, the detected build command runs on the server and the output directory is verified before Nginx reloads. Gzip and SPA fallback routing are configured automatically.
 
 ---
 
@@ -207,9 +209,9 @@ Dockerfile reference: https://docs.docker.com/get-started/
 deploy-helper update
 ```
 
-- Creates a code snapshot before deploying — rollback is always available
+- Creates a code snapshot before deploying and mirrors local source, removing stale remote files while preserving `.env` and dependency directories
 - Reuses init's startup logic: appMode / conda / composeFile all respected
-- Health check after restart (PM2 online / supervisor RUNNING / container running)
+- Process and HTTP checks after restart; a failed check makes the deployment fail instead of reporting success
 - Multi-server support: parallel, serial, or rolling strategies
 
 ---
@@ -222,7 +224,7 @@ deploy-helper rollback
 
 Every `update` creates a snapshot automatically (last 5 kept). Rolling back:
 
-1. Backs up the current version first (so you can undo the rollback)
+1. Backs up the current version without pruning the snapshot selected for restore
 2. Stops the service
 3. Restores code via rsync (preserves `venv/` / `node_modules/`, only replaces code)
 4. Restarts the service + health check
@@ -260,7 +262,7 @@ Supports MySQL, PostgreSQL, and MongoDB:
 ## Requirements
 
 **Local machine**
-- Node.js 18+
+- Node.js 20.12+
 
 **Server**
 - Ubuntu 20.04 / 22.04 / 24.04
@@ -273,7 +275,7 @@ Supports MySQL, PostgreSQL, and MongoDB:
 
 ## Config File
 
-After the first deployment, `.deploy-config.json` is written to your project root. It stores the server address, deploy path, start command, and more. The tool automatically adds it to `.gitignore` — it may contain passwords or keys and should never be committed.
+After the first deployment, `.deploy-config.json` is written to your project root. It stores server addresses, deploy paths, and commands, but strips SSH and database passwords before writing. The tool adds it to `.gitignore`; it still contains infrastructure details and should not be committed.
 
 ---
 
@@ -310,24 +312,23 @@ deploy-helper init
 
 ## 工作流程
 
-**Web 服务**（5 步）：
+向导开始前会先识别 Windows、macOS 或 Linux，再检查 Git 与 SSH，并给出对应系统的安装方法。正式部署前还会询问是否配置 SSH 免密登录。
+
+**Web 服务**（7 个引导阶段）：
 
 ```
-[1/5] 服务器连接信息      → 输入 IP、SSH 密钥/密码，立即测试连通性
-[2/5] 项目信息            → 自动检测类型、版本、启动命令，逐一确认
-[3/5] 域名 & HTTPS        → 可选，自动申请 Let's Encrypt 免费证书
-[4/5] 安装服务器环境      → 按需安装依赖，已安装的跳过
-[5/5] 上传代码并启动服务  → 上传 → 启动进程 → 配置 Nginx → 健康检查
+[1/7] 连接服务器          → 填写 IP、SSH 端口、用户和密码/密钥
+[2/7] 确认项目            → 检测类型、运行环境、应用端口和启动命令
+[3/7] 代码与环境变量      → 选择本地上传或 Git 拉取，逐个填写模板变量
+[4/7] 域名与 HTTPS        → 完全可选；没有域名便跳过 Nginx 和证书
+[5/7] 安装服务器环境      → Git、Docker/Compose、运行环境和可选 Web 工具
+[6/7] 构建并启动          → 安装依赖、构建镜像、启动服务
+[7/7] 配置并验证          → 可选 Nginx/HTTPS、进程检查和网页检查
 ```
 
-**后台脚本 / 定时任务**（4 步，跳过域名和 Nginx）：
+每个实际执行步骤都会先征得同意。可修改的错误能返回上一步，网络问题能重试，自动安装失败会显示手动修复命令。每一阶段结束后，非敏感进度会写入 `.deploy-progress.json`，密码、令牌和环境变量值不会写入。按 Ctrl+C、输入 `exit`、关闭终端或意外断电后，下次运行都可以从最近保存的位置继续。
 
-```
-[1/4] 服务器连接信息
-[2/4] 项目信息（含运行方式选择）
-[3/4] 安装服务器环境
-[4/4] 上传代码并启动
-```
+**后台脚本 / 定时任务**使用同一流程，并明确跳过域名、Nginx 和 HTTPS。
 
 完成后：
 
@@ -381,19 +382,20 @@ init 时选择三种模式之一，影响进程管理和是否配置 Nginx：
 自动检测：`.nvmrc` / `.node-version` / `package.json engines.node` → Node.js 版本；`package.json scripts.start` / 常见入口文件 → 启动命令。
 
 - 进程管理：**PM2**（自动重启、开机自启）
-- 支持 `npm start`、`node server.js`、`next start` 等所有启动方式
-- **后台脚本模式**：PM2 加 `--no-autorestart`，进程正常退出后不重启
+- 使用 npm 感知的启动命令，Next.js / Nuxt 等本地二进制可以正确解析
+- 检测到构建脚本时自动执行 `npm run build`，之后裁剪仅构建期依赖
+- **后台脚本模式**：PM2 在异常退出时重启，进程正常退出后不重启
 - **定时任务模式**：写入 crontab，日志写入 `/var/log/<appname>.log`
 
 ### Python
 
-自动检测：`.python-version` / `pyproject.toml` → Python 版本；`requirements.txt` → 框架（FastAPI / Django / Flask）→ 推荐启动命令；`environment.yml` / `conda-lock.yml` → conda 模式。
+自动检测：`.python-version` / `pyproject.toml` → Python 版本；`requirements.txt` / `pyproject.toml` → 框架（FastAPI / Django / Flask）→ 推荐启动命令；`environment.yml` / `conda-lock.yml` → conda 模式。
 
 进程管理：**supervisor**（自动重启、开机自启、日志写入 `/var/log/<appname>.out.log` + `.err.log`）
 
-**pip 模式**（有 `requirements.txt`）
+**pip 模式**（有 `requirements.txt` 或 `pyproject.toml`）
 - 服务器无 Python 时自动安装（deadsnakes PPA，支持 3.8–3.13），已有则跳过
-- 自动创建 virtualenv，所有包装在 `venv/` 内，不污染系统环境
+- 自动创建 virtualenv，并从 `requirements.txt` 或本地 `pyproject.toml` 项目安装依赖
 - FastAPI → uvicorn；Django / Flask → gunicorn
 - **后台脚本模式**：supervisor `autorestart=unexpected`（只有崩溃才重启，正常退出不重启）
 - **定时任务模式**：写入 crontab，用 venv 内的 Python 执行
@@ -434,7 +436,7 @@ conda env export > environment.yml
 
 ### 静态网站
 
-纯 HTML / CSS / JS，直接由 Nginx 托管，自动配置 gzip 和 SPA 回退路由。`dist/` 等构建产物会正常上传（不会被跳过）。
+纯 HTML / CSS / JS 直接由 Nginx 托管。Vite/React 等项目会在服务器执行检测到的构建命令，并在重载 Nginx 前验证构建目录和 `index.html`，同时自动配置 gzip 和 SPA 回退路由。
 
 ---
 
@@ -492,9 +494,9 @@ Dockerfile 入门：https://docs.docker.com/get-started/
 deploy-helper update
 ```
 
-- 部署前自动创建代码快照，失败可立即 rollback
+- 部署前自动创建代码快照，并镜像同步本地源码；删除远端陈旧文件，但保留 `.env` 和依赖目录
 - 复用 init 的启动逻辑，appMode / conda / composeFile 全部生效
-- 重启后健康检查（PM2 online / supervisor RUNNING / 容器 running）
+- 重启后同时检查进程和 HTTP；检查失败会判定部署失败，不再显示假成功
 - 支持多台服务器：并行 / 串行 / 滚动三种策略
 
 ---
@@ -507,7 +509,7 @@ deploy-helper rollback
 
 每次 `update` 前自动创建快照，保留最近 5 个版本。回滚时：
 
-1. 备份当前版本（以便反悔）
+1. 备份当前版本，且不会在此时裁剪用户选中的待恢复快照
 2. 停止服务
 3. 用 rsync 还原代码（保留 `venv/` / `node_modules/`，只换代码）
 4. 重启服务 + 健康检查
@@ -545,7 +547,7 @@ deploy-helper backup
 ## 前提条件
 
 **本地**
-- Node.js 18+
+- Node.js 20.12+
 
 **服务器**
 - Ubuntu 20.04 / 22.04 / 24.04
@@ -558,7 +560,7 @@ deploy-helper backup
 
 ## 配置文件
 
-首次部署后，项目根目录生成 `.deploy-config.json`，记录服务器地址、部署路径、启动命令等。工具会自动将其加入 `.gitignore`（文件中含服务器密码 / 密钥，请勿提交到 git）。
+首次部署后，项目根目录生成 `.deploy-config.json`，记录服务器地址、部署路径和命令等；SSH 与数据库密码会在写入前剥离。工具会自动将其加入 `.gitignore`，因为其中仍包含基础设施信息，请勿提交到 git。
 
 ---
 

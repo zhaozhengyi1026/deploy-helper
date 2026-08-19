@@ -1,7 +1,12 @@
 node_modules/
 .deploy-config.json
+.deploy-progress.json
+.deploy-progress.json.tmp
 .env
 *.log
 PUBLISHING.md
 article.md
 low-alt_eco_3/
+npm步骤.md
+.npmignore
+AGENTS.md
