@@ -2,8 +2,8 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import { connectSSH, runRemoteSilent, runRemoteStrict } from '../utils/ssh.js';
-import { loadConfig, resolveCredentials } from '../utils/config.js';
-import { getStartCommands, getStopCommand, getHealthCheck } from '../utils/setup.js';
+import { loadConfig, saveConfig, resolveCredentials, selectServer } from '../utils/config.js';
+import { getStartCommands, getStopCommand, getHealthCheck, getHttpHealthCheck, writeFileHeredoc } from '../utils/setup.js';
 
 const SNAPSHOTS_DIR = '/var/deploy-helper/snapshots';
 
@@ -11,22 +11,25 @@ const SNAPSHOTS_DIR = '/var/deploy-helper/snapshots';
  * 部署时调用：把当前版本打快照存起来
  * 保留最近 5 个版本，多余的自动删除
  */
-export async function createSnapshot(ssh, config) {
+export async function createSnapshot(ssh, config, { prune = true } = {}) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const snapshotName = `${config.appName}_${timestamp}`;
   const snapshotPath = `${SNAPSHOTS_DIR}/${snapshotName}`;
 
-  await runRemoteSilent(ssh, `mkdir -p ${SNAPSHOTS_DIR}`);
+  await runRemoteStrict(ssh, `mkdir -p ${SNAPSHOTS_DIR} && chmod 700 ${SNAPSHOTS_DIR}`);
 
   // 如果当前部署目录存在，就复制一份作为快照
-  const exists = await runRemoteSilent(ssh, `test -d ${config.remotePath} && echo yes || echo no`);
-  if (exists.stdout.trim() === 'yes') {
+  const exists = await runRemoteSilent(
+    ssh,
+    `find ${config.remotePath} -type f -not -path '*/node_modules/*' -not -path '*/venv/*' -not -path '*/__pycache__/*' 2>/dev/null | head -1`
+  );
+  if (exists.stdout.trim()) {
     // 排除大目录（venv / node_modules）节省空间
     // 用 strict：rsync 失败（如未安装）必须抛错，否则会留下空快照 —— 之后回滚 --delete 会清空部署目录
     await runRemoteStrict(
       ssh,
-      `command -v rsync >/dev/null 2>&1 || apt-get install -y -qq rsync; ` +
-      `rsync -a --exclude=venv --exclude=node_modules --exclude=__pycache__ ${config.remotePath}/ ${snapshotPath}/`
+      `command -v rsync >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq rsync); ` +
+      `rsync -a --exclude=venv --exclude=.venv --exclude=node_modules --exclude=__pycache__ ${config.remotePath}/ ${snapshotPath}/`
     );
 
     // 记录快照元信息
@@ -35,15 +38,20 @@ export async function createSnapshot(ssh, config) {
       timestamp,
       appName: config.appName,
       remotePath: config.remotePath,
+      deploymentConfig: Object.fromEntries([
+        'projectType', 'appMode', 'startCmd', 'buildCmd', 'nodeVersion', 'pythonVersion',
+        'pythonFramework', 'pythonEnvManager', 'pythonDependencySource', 'port', 'composeFile', 'staticDir',
+      ].filter(key => config[key] !== undefined).map(key => [key, config[key]])),
     });
-    // 用 printf 写入小型元数据 OK（meta 是 JSON，无 % 字符）
-    await runRemoteSilent(ssh, `cat > ${snapshotPath}/.snapshot-meta.json <<'DH_EOF'\n${meta}\nDH_EOF`);
+    await runRemoteStrict(ssh, writeFileHeredoc(`${snapshotPath}/.snapshot-meta.json`, meta));
 
     // 只保留最近 5 个快照
-    await runRemoteSilent(
-      ssh,
-      `ls -t ${SNAPSHOTS_DIR} | grep "^${config.appName}_" | tail -n +6 | xargs -I{} rm -rf ${SNAPSHOTS_DIR}/{}`
-    );
+    if (prune) {
+      await runRemoteStrict(
+        ssh,
+        `ls -t ${SNAPSHOTS_DIR} | grep "^${config.appName}_" | tail -n +6 | xargs -r -I{} rm -rf ${SNAPSHOTS_DIR}/{}`
+      );
+    }
 
     return snapshotName;
   }
@@ -78,11 +86,6 @@ async function listSnapshots(ssh, config) {
 
 // 根据 config 重启服务（appMode/conda/composeFile 一致）
 async function restartService(ssh, config) {
-  if (config.appMode === 'cron') {
-    // cron 不需要"重启进程"，crontab 条目仍在；下次定时使用新代码即可
-    return;
-  }
-
   if (config.projectType === 'nodejs') {
     // 复用 init 启动逻辑，确保 .start.sh / pm2 配置与新代码匹配
     const steps = getStartCommands(config);
@@ -93,8 +96,11 @@ async function restartService(ssh, config) {
   }
 
   if (config.projectType === 'python') {
-    // 已有 supervisor 配置和 venv/conda 环境，直接重启进程即可
-    await runRemoteStrict(ssh, `supervisorctl restart ${config.appName}`);
+    // 依赖文件也可能随版本变化，回滚后重新同步环境与 supervisor 配置。
+    const steps = getStartCommands(config);
+    for (const s of steps) {
+      await runRemoteStrict(ssh, s.cmd);
+    }
     return;
   }
 
@@ -120,16 +126,19 @@ async function restartService(ssh, config) {
  * rollback 命令主体
  */
 export async function deployRollback() {
-  const config = loadConfig();
+  let config = loadConfig();
   if (!config) {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
 
+  config = await selectServer(config, '回滚版本');
   await resolveCredentials(config);
 
   let ssh;
   const spinner = ora('连接服务器...').start();
+  let preRollbackSnapshot = null;
+  let serviceStopped = false;
   try {
     ssh = await connectSSH(config);
     spinner.succeed('连接成功');
@@ -171,6 +180,8 @@ export async function deployRollback() {
     message: '选择要回滚到的版本：',
     choices,
   }]);
+  const selectedMeta = snapshots.find(snapshot => snapshot.name === selectedSnapshot);
+  const restoreConfig = { ...config, ...(selectedMeta?.deploymentConfig || {}) };
 
   const { confirm } = await inquirer.prompt([{
     type: 'confirm',
@@ -190,15 +201,17 @@ export async function deployRollback() {
   try {
     // 把当前版本也存一个"回滚前"的快照
     const preRollbackSpinner = ora('备份当前版本...').start();
-    await createSnapshot(ssh, config);
+    // 暂不裁剪快照，避免刚好删除用户选择的最旧版本。
+    preRollbackSnapshot = await createSnapshot(ssh, config, { prune: false });
     preRollbackSpinner.succeed('当前版本已备份');
 
     // 停止服务（cron 模式跳过）
     const stopCmd = getStopCommand(config);
     if (stopCmd) {
       const stopSpinner = ora('停止当前服务...').start();
-      await runRemoteSilent(ssh, stopCmd);
+      await runRemoteStrict(ssh, stopCmd);
       stopSpinner.succeed('服务已停止');
+      serviceStopped = true;
     }
 
     // 替换代码目录（保留 venv —— 快照排除了它，避免误删环境）
@@ -215,7 +228,7 @@ export async function deployRollback() {
     // 保留 venv / node_modules，只覆盖代码部分；strict：还原失败必须抛错
     await runRemoteStrict(
       ssh,
-      `rsync -a --delete --exclude=venv --exclude=node_modules ${SNAPSHOTS_DIR}/${selectedSnapshot}/ ${config.remotePath}/`
+      `rsync -a --delete --exclude=venv --exclude=.venv --exclude=node_modules ${SNAPSHOTS_DIR}/${selectedSnapshot}/ ${config.remotePath}/`
     );
     await runRemoteSilent(ssh, `rm -f ${config.remotePath}/.snapshot-meta.json`);
     restoreSpinner.succeed('版本已还原');
@@ -223,7 +236,7 @@ export async function deployRollback() {
     // 重启服务
     const startSpinner = ora('重启服务...').start();
     try {
-      await restartService(ssh, config);
+      await restartService(ssh, restoreConfig);
       startSpinner.succeed('服务已重启');
     } catch (err) {
       startSpinner.fail('重启失败：' + err.message);
@@ -231,7 +244,7 @@ export async function deployRollback() {
     }
 
     // 健康检查
-    const health = getHealthCheck(config);
+    const health = getHealthCheck(restoreConfig);
     if (health) {
       const hSpinner = ora('验证服务运行状态...').start();
       await runRemoteSilent(ssh, 'sleep 2');
@@ -240,16 +253,56 @@ export async function deployRollback() {
       if (parsed.ok) {
         hSpinner.succeed(`服务正常 — ${chalk.gray(parsed.detail)}`);
       } else {
-        hSpinner.warn(`健康检查未通过 — ${chalk.yellow(parsed.detail)}`);
+        hSpinner.fail(`健康检查未通过 — ${chalk.yellow(parsed.detail)}`);
+        throw new Error(`健康检查未通过：${parsed.detail}`);
       }
     }
 
+    const httpHealth = getHttpHealthCheck(restoreConfig);
+    if (httpHealth) {
+      const hSpinner = ora('验证 HTTP 入口...').start();
+      const result = await runRemoteSilent(ssh, httpHealth.cmd);
+      const parsed = httpHealth.parse(result);
+      if (!parsed.ok) {
+        hSpinner.fail(`HTTP 验证失败 — ${parsed.detail}`);
+        throw new Error(`HTTP 入口不可用：${parsed.detail}`);
+      }
+      hSpinner.succeed(`HTTP 入口正常 — ${parsed.detail}`);
+    }
+
     ssh.dispose();
+    const rootConfig = config.__rootConfig || config;
+    if (Array.isArray(rootConfig.servers)) {
+      rootConfig.servers = rootConfig.servers.map(server =>
+        server.host === config.host && String(server.sshPort || server.port || 22) === String(config.sshPort || config.port || 22)
+          ? { ...server, ...(selectedMeta?.deploymentConfig || {}), deployedAt: new Date().toISOString() }
+          : server
+      );
+    } else {
+      Object.assign(rootConfig, selectedMeta?.deploymentConfig || {});
+    }
+    rootConfig.deployedAt = new Date().toISOString();
+    saveConfig(rootConfig);
     console.log(chalk.green.bold('\n✅ 回滚成功！'));
     console.log(chalk.gray(`  已恢复到版本：${selectedSnapshot}\n`));
 
   } catch (err) {
     console.log(chalk.red('\n回滚失败：' + err.message));
+    if (serviceStopped && preRollbackSnapshot) {
+      const recoverySpinner = ora('正在恢复回滚前版本并重启服务...').start();
+      try {
+        await runRemoteStrict(
+          ssh,
+          `rsync -a --delete --exclude=venv --exclude=.venv --exclude=node_modules ${SNAPSHOTS_DIR}/${preRollbackSnapshot}/ ${config.remotePath}/`
+        );
+        await runRemoteSilent(ssh, `rm -f ${config.remotePath}/.snapshot-meta.json`);
+        await restartService(ssh, config);
+        recoverySpinner.succeed('已恢复回滚前版本，原服务已重新启动');
+      } catch (recoveryError) {
+        recoverySpinner.fail('自动恢复失败，请立即检查服务器');
+        console.log(chalk.red(`  恢复错误：${recoveryError.message}`));
+      }
+    }
     ssh.dispose();
   }
 }

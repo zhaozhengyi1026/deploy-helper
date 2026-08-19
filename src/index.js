@@ -8,10 +8,12 @@ import { deployStatus } from './commands/status.js';
 import { deployRollback } from './commands/rollback.js';
 import { deployEnv } from './commands/env.js';
 import { deployBackup } from './commands/backup.js';
+import { printPlatformSummary } from './utils/onboarding.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
 
+printPlatformSummary();
 console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(` v${version} — 把项目部署到服务器，就这么简单\n`));
 
 // Ctrl+C 中断 inquirer 交互时优雅退出，不显示堆栈
@@ -21,14 +23,22 @@ function onExitPromptError(err) {
     process.exit(0);
   }
 }
+function printUnexpectedError(err) {
+  console.error(chalk.red('\n发生未处理错误：') + (err?.message || String(err)));
+  if (process.env.DEPLOY_HELPER_DEBUG === '1' && err?.stack) {
+    console.error(chalk.gray(err.stack));
+  } else {
+    console.error(chalk.gray('设置 DEPLOY_HELPER_DEBUG=1 可查看完整堆栈。'));
+  }
+}
 process.on('uncaughtException', (err) => {
   onExitPromptError(err);
-  console.error(err);
+  printUnexpectedError(err);
   process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
   onExitPromptError(err);
-  console.error(err);
+  printUnexpectedError(err);
   process.exit(1);
 });
 
@@ -84,5 +94,16 @@ if (process.argv.length === 2) {
   console.log(`  ${chalk.cyan('status')}    查看运行状态\n`);
   console.log(chalk.gray('首次使用？运行：') + chalk.cyan(' deploy-helper init\n'));
 } else {
-  program.parse();
+  try {
+    await program.parseAsync();
+  } catch (error) {
+    if (error?.code === 'DEPLOY_PAUSE' || error?.constructor?.name === 'ExitPromptError') {
+      console.log(chalk.yellow('\n已安全停止，当前部署进度已经保存。'));
+      console.log(chalk.gray('下次运行 deploy-helper init 时，会询问是否继续。\n'));
+      process.exitCode = 0;
+    } else {
+      printUnexpectedError(error);
+      process.exitCode = 1;
+    }
+  }
 }

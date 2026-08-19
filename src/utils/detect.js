@@ -69,13 +69,14 @@ export function detectPythonEnvManager(projectPath = process.cwd()) {
 // 从 requirements.txt 检测 Python 框架
 export function detectPythonFramework(projectPath = process.cwd()) {
   const reqPath = path.join(projectPath, 'requirements.txt');
-  if (!fs.existsSync(reqPath)) return null;
+  const pyprojectPath = path.join(projectPath, 'pyproject.toml');
+  if (!fs.existsSync(reqPath) && !fs.existsSync(pyprojectPath)) return null;
 
-  const content = fs.readFileSync(reqPath, 'utf-8').toLowerCase();
+  const content = fs.readFileSync(fs.existsSync(reqPath) ? reqPath : pyprojectPath, 'utf-8').toLowerCase();
   // 按优先级检测，fastapi 优先（flask 是 fastapi 的间接依赖有时也会出现）
-  if (content.match(/^fastapi[>=\[<\s]/m) || content.includes('\nfastapi')) return 'fastapi';
-  if (content.match(/^django[>=\[<\s]/m) || content.includes('\ndjango')) return 'django';
-  if (content.match(/^flask[>=\[<\s]/m) || content.includes('\nflask')) return 'flask';
+  if (/\bfastapi\b/.test(content)) return 'fastapi';
+  if (/\bdjango\b/.test(content)) return 'django';
+  if (/\bflask\b/.test(content)) return 'flask';
   return null;
 }
 
@@ -105,12 +106,12 @@ export function getNodeStartCommand(projectPath = process.cwd()) {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
 
     if (pkg.scripts?.start) {
-      return { cmd: pkg.scripts.start, source: 'package.json scripts.start' };
+      return { cmd: 'npm start', source: 'package.json scripts.start' };
     }
 
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-    if (deps['next']) return { cmd: 'next start', source: 'next.js 依赖' };
-    if (deps['nuxt']) return { cmd: 'nuxt start', source: 'nuxt.js 依赖' };
+    if (deps['next']) return { cmd: 'npm exec -- next start', source: 'next.js 依赖' };
+    if (deps['nuxt']) return { cmd: 'npm exec -- nuxt start', source: 'nuxt.js 依赖' };
   }
 
   for (const file of ['index.js', 'app.js', 'server.js', 'main.js']) {
@@ -122,10 +123,48 @@ export function getNodeStartCommand(projectPath = process.cwd()) {
   return { cmd: 'node index.js', source: '默认值' };
 }
 
+export function getNodeBuildCommand(projectPath = process.cwd()) {
+  const pkgPath = path.join(projectPath, 'package.json');
+  if (!fs.existsSync(pkgPath)) return null;
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  if (pkg.scripts?.build) return { cmd: 'npm run build', source: 'package.json scripts.build' };
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  if (deps.next) return { cmd: 'npm exec -- next build', source: 'Next.js 默认构建命令' };
+  if (deps.nuxt) return { cmd: 'npm exec -- nuxt build', source: 'Nuxt 默认构建命令' };
+  return null;
+}
+
+export function detectStaticOutputDir(projectPath = process.cwd()) {
+  const pkgPath = path.join(projectPath, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (deps['react-scripts']) return 'build';
+    if (deps.next) return 'out';
+    if (deps.vite || deps['@vue/cli-service'] || deps.nuxt) return 'dist';
+  }
+  for (const dir of ['dist', 'build', 'out', 'public']) {
+    if (fs.existsSync(path.join(projectPath, dir))) return dir;
+  }
+  if (!fs.existsSync(pkgPath)) return '';
+  return 'dist';
+}
+
+export function detectPythonDependencySource(projectPath = process.cwd()) {
+  if (fs.existsSync(path.join(projectPath, 'requirements.txt'))) return 'requirements';
+  if (fs.existsSync(path.join(projectPath, 'pyproject.toml'))) return 'pyproject';
+  return null;
+}
+
 // 根据框架生成 Python 启动命令；framework 为 other 时扫描常见入口文件
 export function getPythonStartCommand(framework, appName, port, projectPath = process.cwd()) {
   if (framework === 'fastapi') return `uvicorn main:app --host 0.0.0.0 --port ${port}`;
-  if (framework === 'django') return `gunicorn ${appName}.wsgi:application --bind 0.0.0.0:${port}`;
+  if (framework === 'django') {
+    const entries = fs.readdirSync(projectPath, { withFileTypes: true });
+    const djangoDir = entries.find(entry => entry.isDirectory() && fs.existsSync(path.join(projectPath, entry.name, 'wsgi.py')));
+    const moduleName = djangoDir?.name || appName;
+    return `gunicorn ${moduleName}.wsgi:application --bind 0.0.0.0:${port}`;
+  }
   if (framework === 'flask') return `gunicorn app:app --bind 0.0.0.0:${port}`;
   for (const file of ['main.py', 'app.py', 'run.py', 'server.py', 'manage.py']) {
     if (fs.existsSync(path.join(projectPath, file))) return `python ${file}`;

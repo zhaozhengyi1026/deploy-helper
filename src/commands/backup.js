@@ -2,14 +2,43 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import path from 'path';
-import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig, saveConfig, resolveCredentials } from '../utils/config.js';
+import fs from 'fs';
+import { connectSSH, runRemoteSilent, runRemoteStrict } from '../utils/ssh.js';
+import { loadConfig, saveConfig, resolveCredentials, selectServer } from '../utils/config.js';
 
 const BACKUP_BASE = '/var/deploy-helper/db-backups';
 
 // POSIX 单引号转义：密码/用户名含 ' $ 等特殊字符时也能安全拼进 shell 命令
 function shellQuote(str) {
   return `'` + String(str ?? '').replace(/'/g, `'\\''`) + `'`;
+}
+
+function writeRemoteFileCommand(remotePath, content) {
+  const encoded = Buffer.from(content, 'utf-8').toString('base64');
+  return `printf '%s' '${encoded}' | base64 -d > ${shellQuote(remotePath)}`;
+}
+
+function validateDatabaseConfig(config) {
+  if (!['mysql', 'postgresql', 'mongodb'].includes(config?.type)) return '不支持的数据库类型';
+  if (!/^[a-zA-Z0-9_.-]+$/.test(config.database || '')) return '数据库名只能包含字母、数字、点、下划线和连字符';
+  if (!/^\d+$/.test(String(config.port || ''))) return '数据库端口必须是数字';
+  if (!String(config.user || '').trim()) return '数据库用户名不能为空';
+  return null;
+}
+
+async function ensureDatabaseTool(ssh, type) {
+  const tools = {
+    mysql: { command: 'mysqldump', install: 'apt-get install -y -qq default-mysql-client' },
+    postgresql: { command: 'pg_dump', install: 'apt-get install -y -qq postgresql-client' },
+    mongodb: { command: 'mongodump', install: null },
+  };
+  const tool = tools[type];
+  const exists = await runRemoteSilent(ssh, `command -v ${tool.command}`);
+  if (exists.code === 0) return;
+  if (!tool.install) {
+    throw new Error('服务器缺少 mongodump，请先安装 MongoDB Database Tools 后重试');
+  }
+  await runRemoteStrict(ssh, `export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && ${tool.install}`);
 }
 
 /**
@@ -24,17 +53,17 @@ function buildDumpCommand(dbConfig, outputFile, passwordEnvInline = true) {
   if (type === 'mysql') {
     const p = port || 3306;
     const pwd = passwordEnvInline ? `MYSQL_PWD=${shellQuote(password)} ` : '';
-    return `${pwd}mysqldump -h ${h} -P ${p} -u ${user} ${database} > ${outputFile}`;
+    return `${pwd}mysqldump -h ${shellQuote(h)} -P ${shellQuote(p)} -u ${shellQuote(user)} ${shellQuote(database)} > ${shellQuote(outputFile)}`;
   }
   if (type === 'postgresql') {
     const p = port || 5432;
     const pwd = passwordEnvInline ? `PGPASSWORD=${shellQuote(password)} ` : '';
-    return `${pwd}pg_dump -h ${h} -p ${p} -U ${user} ${database} > ${outputFile}`;
+    return `${pwd}pg_dump -h ${shellQuote(h)} -p ${shellQuote(p)} -U ${shellQuote(user)} ${shellQuote(database)} > ${shellQuote(outputFile)}`;
   }
   if (type === 'mongodb') {
     const p = port || 27017;
-    const auth = password ? `--username ${user} --password ${shellQuote(password)} --authenticationDatabase admin` : '';
-    return `mongodump --host ${h} --port ${p} ${auth} --db ${database} --archive=${outputFile} --gzip`;
+    const auth = password ? `--username ${shellQuote(user)} --password ${shellQuote(password)} --authenticationDatabase admin` : '';
+    return `mongodump --host ${shellQuote(h)} --port ${shellQuote(p)} ${auth} --db ${shellQuote(database)} --archive=${shellQuote(outputFile)} --gzip`;
   }
   return null;
 }
@@ -58,12 +87,13 @@ async function listBackups(ssh, appName) {
 }
 
 export async function deployBackup() {
-  const config = loadConfig();
+  let config = loadConfig();
   if (!config) {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
 
+  config = await selectServer(config, '管理数据库备份');
   await resolveCredentials(config);
 
   const { action } = await inquirer.prompt([{
@@ -104,20 +134,26 @@ async function doBackup(config, silent = false) {
         ],
       },
       { type: 'input', name: 'host', message: '数据库地址：', default: '127.0.0.1' },
-      { type: 'input', name: 'port', message: '端口：', default: (a) => ({ mysql: '3306', postgresql: '5432', mongodb: '27017' }[a.type]) },
-      { type: 'input', name: 'user', message: '用户名：', default: 'root' },
+      { type: 'input', name: 'port', message: '端口：', default: (a) => ({ mysql: '3306', postgresql: '5432', mongodb: '27017' }[a.type]), validate: v => /^\d+$/.test(v) ? true : '请输入数字端口' },
+      { type: 'input', name: 'user', message: '用户名：', default: 'root', validate: v => v.trim() ? true : '请输入用户名' },
       { type: 'password', name: 'password', message: '密码：', mask: '*' },
-      { type: 'input', name: 'database', message: '数据库名：', validate: v => v.trim() ? true : '请输入数据库名' },
+      { type: 'input', name: 'database', message: '数据库名：', validate: v => /^[a-zA-Z0-9_.-]+$/.test(v) ? true : '只能包含字母、数字、点、下划线和连字符' },
     ]);
     dbConfig = answers;
 
     // 保存到 config（saveConfig 会自动剥离密码，不落盘）
-    const updated = { ...config, database: dbConfig };
+    const updated = { ...(config.__rootConfig || config), database: dbConfig };
     saveConfig(updated);
   } else if (dbConfig.password === undefined) {
     // 已有数据库配置但密码未落盘，按需补齐
     await resolveCredentials(config, { needDatabase: true });
     dbConfig = config.database;
+  }
+
+  const validationError = validateDatabaseConfig(dbConfig);
+  if (validationError) {
+    console.log(chalk.red(`\n数据库配置无效：${validationError}\n`));
+    return null;
   }
 
   let ssh;
@@ -131,6 +167,7 @@ async function doBackup(config, silent = false) {
   }
 
   try {
+    await ensureDatabaseTool(ssh, dbConfig.type);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const ext = dbConfig.type === 'mongodb' ? '.archive.gz' : '.sql.gz';
     const filename = `${dbConfig.database}_${timestamp}${ext}`;
@@ -138,7 +175,7 @@ async function doBackup(config, silent = false) {
     const outputFile = `${backupDir}/${filename}`;
     const rawFile = outputFile.replace('.gz', '');
 
-    await runRemoteSilent(ssh, `mkdir -p ${backupDir}`);
+    await runRemoteStrict(ssh, `mkdir -p ${shellQuote(backupDir)} && chmod 700 ${shellQuote(backupDir)}`);
 
     // 生成备份（一次性命令：内联密码 OK，进程退出即消失）
     const dumpSpinner = ora(`备份 ${dbConfig.type} 数据库 [${dbConfig.database}]...`).start();
@@ -154,18 +191,22 @@ async function doBackup(config, silent = false) {
 
     // MySQL/PostgreSQL 压缩
     if (dbConfig.type !== 'mongodb') {
-      await runRemoteSilent(ssh, `gzip -f ${rawFile}`);
+      await runRemoteStrict(ssh, `gzip -f ${shellQuote(rawFile)}`);
     }
 
+    await runRemoteStrict(ssh, `test -s ${shellQuote(outputFile)}`);
+    await runRemoteStrict(ssh, `chmod 600 ${shellQuote(outputFile)}`);
+
     // 获取文件大小
-    const sizeResult = await runRemoteSilent(ssh, `du -sh ${outputFile} | cut -f1`);
+    const sizeResult = await runRemoteStrict(ssh, `du -sh ${shellQuote(outputFile)} | cut -f1`);
     dumpSpinner.succeed(`备份完成 → ${chalk.cyan(filename)} ${chalk.gray('(' + sizeResult.stdout + ')')}`);
 
     // 只保留最近 10 个备份
-    await runRemoteSilent(
+    const cleanup = await runRemoteSilent(
       ssh,
-      `ls -t ${backupDir} | tail -n +11 | xargs -I{} rm -f ${backupDir}/{} 2>/dev/null || true`
+      `ls -t ${backupDir} | tail -n +11 | xargs -r -I{} rm -f ${backupDir}/{}`
     );
+    if (cleanup.code !== 0) console.log(chalk.yellow('  ⚠ 旧备份清理失败，请检查服务器磁盘空间'));
 
     ssh.dispose();
     return { filename, outputFile };
@@ -236,9 +277,20 @@ async function downloadBackup(config) {
   const localPath = path.join(process.cwd(), selected);
   const remotePath = `${BACKUP_BASE}/${config.appName}/${selected}`;
 
+  if (fs.existsSync(localPath)) {
+    const { overwrite } = await inquirer.prompt([{
+      type: 'confirm', name: 'overwrite', message: `本地已存在 ${selected}，确认覆盖？`, default: false,
+    }]);
+    if (!overwrite) {
+      ssh.dispose();
+      return;
+    }
+  }
+
   const dlSpinner = ora(`下载 ${selected}...`).start();
   try {
     await ssh.getFile(localPath, remotePath);
+    try { fs.chmodSync(localPath, 0o600); } catch { /* Windows may not apply POSIX modes. */ }
     dlSpinner.succeed(`已下载到：${chalk.cyan(localPath)}`);
   } catch (err) {
     dlSpinner.fail('下载失败：' + err.message);
@@ -248,6 +300,10 @@ async function downloadBackup(config) {
 }
 
 async function scheduleBackup(config) {
+  if (!config.database) {
+    console.log(chalk.red('\n未配置数据库信息，请先运行一次备份完成配置。\n'));
+    return;
+  }
   const { frequency } = await inquirer.prompt([{
     type: 'list',
     name: 'frequency',
@@ -266,15 +322,11 @@ async function scheduleBackup(config) {
       type: 'input',
       name: 'custom',
       message: 'Cron 表达式（如 "0 3 * * *" 表示每天 3 点）：',
-      validate: v => v.trim().split(/\s+/).length === 5 ? true : '请输入正确的 5 段 Cron 表达式',
+      validate: v => /^([\d*/?,\-]+\s+){4}[\d*/?,\-]+$/.test(v.trim()) ? true : '请输入安全的 5 段 Cron 表达式',
     }]);
     cronExpr = custom;
   }
 
-  if (!config.database) {
-    console.log(chalk.red('\n未配置数据库信息，请先运行一次备份完成配置。\n'));
-    return;
-  }
   // 数据库密码不落盘，写凭据文件前先补齐
   if (config.database.password === undefined) {
     await resolveCredentials(config, { needDatabase: true });
@@ -296,6 +348,9 @@ async function scheduleBackup(config) {
       ssh.dispose();
       return;
     }
+    const validationError = validateDatabaseConfig(dbConfig);
+    if (validationError) throw new Error(`数据库配置无效：${validationError}`);
+    await ensureDatabaseTool(ssh, dbConfig.type);
 
     const backupDir = `${BACKUP_BASE}/${config.appName}`;
     const ext = dbConfig.type === 'mongodb' ? '.archive.gz' : '.sql.gz';
@@ -309,24 +364,24 @@ async function scheduleBackup(config) {
       return '';
     })();
 
-    await runRemoteSilent(ssh, `mkdir -p /etc/deploy-helper && chmod 700 /etc/deploy-helper`);
-    await runRemoteSilent(ssh, `cat > ${credPath} <<'DH_CRED_EOF'\n${credContent}DH_CRED_EOF`);
-    await runRemoteSilent(ssh, `chmod 600 ${credPath}`);
+    await runRemoteStrict(ssh, `mkdir -p /etc/deploy-helper && chmod 700 /etc/deploy-helper`);
+    await runRemoteStrict(ssh, writeRemoteFileCommand(credPath, credContent));
+    await runRemoteStrict(ssh, `chmod 600 ${credPath}`);
 
     // 生成备份命令（不内联密码，从 cred 文件加载）
     const dumpForScript = (() => {
       const h = dbConfig.host || '127.0.0.1';
       if (dbConfig.type === 'mysql') {
-        return `mysqldump -h ${h} -P ${dbConfig.port || 3306} -u ${dbConfig.user} ${dbConfig.database} > "\${OUTFILE%.gz}"`;
+        return `mysqldump -h ${shellQuote(h)} -P ${shellQuote(dbConfig.port || 3306)} -u ${shellQuote(dbConfig.user)} ${shellQuote(dbConfig.database)} > "\${OUTFILE%.gz}"`;
       }
       if (dbConfig.type === 'postgresql') {
-        return `pg_dump -h ${h} -p ${dbConfig.port || 5432} -U ${dbConfig.user} ${dbConfig.database} > "\${OUTFILE%.gz}"`;
+        return `pg_dump -h ${shellQuote(h)} -p ${shellQuote(dbConfig.port || 5432)} -U ${shellQuote(dbConfig.user)} ${shellQuote(dbConfig.database)} > "\${OUTFILE%.gz}"`;
       }
       if (dbConfig.type === 'mongodb') {
         const auth = dbConfig.password
           ? `--username "$DH_MONGO_USER" --password "$DH_MONGO_PWD" --authenticationDatabase admin`
           : '';
-        return `mongodump --host ${h} --port ${dbConfig.port || 27017} ${auth} --db ${dbConfig.database} --archive="$OUTFILE" --gzip`;
+        return `mongodump --host ${shellQuote(h)} --port ${shellQuote(dbConfig.port || 27017)} ${auth} --db ${shellQuote(dbConfig.database)} --archive="$OUTFILE" --gzip`;
       }
       return '';
     })();
@@ -334,6 +389,7 @@ async function scheduleBackup(config) {
     // 生成备份脚本（heredoc 单引号 EOF：变量不展开，原样写入）
     const scriptContent = `#!/bin/bash
 set -e
+umask 077
 . ${credPath}
 TIMESTAMP=$(date +%Y-%m-%dT%H-%M-%S)
 OUTFILE="${backupDir}/${dbConfig.database}_\${TIMESTAMP}${ext}"
@@ -345,12 +401,12 @@ echo "[$(date)] Backup completed: \$OUTFILE" >> /var/log/deploy-helper-backup.lo
 `;
 
     const scriptPath = `/usr/local/bin/deploy-helper-backup-${config.appName}.sh`;
-    await runRemoteSilent(ssh, `cat > ${scriptPath} <<'DH_SCRIPT_EOF'\n${scriptContent}DH_SCRIPT_EOF`);
+    await runRemoteStrict(ssh, writeRemoteFileCommand(scriptPath, scriptContent));
     // 脚本本身含密码加载逻辑——chmod 700 仅 root 可读
-    await runRemoteSilent(ssh, `chmod 700 ${scriptPath} && chown root:root ${scriptPath}`);
+    await runRemoteStrict(ssh, `chmod 700 ${scriptPath} && chown root:root ${scriptPath}`);
 
     // 注入 crontab（root 用户的 crontab）
-    await runRemoteSilent(
+    await runRemoteStrict(
       ssh,
       `(crontab -l 2>/dev/null | grep -v "deploy-helper-backup-${config.appName}"; echo "${cronExpr} ${scriptPath}") | crontab -`
     );

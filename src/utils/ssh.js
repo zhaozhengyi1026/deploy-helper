@@ -7,7 +7,7 @@ export async function connectSSH(config) {
 
   const connectOptions = {
     host: config.host,
-    port: config.port || 22,
+    port: config.sshPort || config.port || 22,
     username: config.user,
     // 安装依赖、交互问答可能持续数分钟，开启心跳防止服务器 idle 超时断连
     keepaliveInterval: 15000,
@@ -61,8 +61,8 @@ export async function runRemote(ssh, command, label) {
     onStderr: (chunk) => process.stdout.write(chalk.yellow('    ' + chunk.toString())),
   });
 
-  if (result.code !== 0 && result.code !== null) {
-    throw new Error(`命令失败 (exit ${result.code}): ${command}\n${result.stderr}`);
+  if (result.code !== 0) {
+    throw new Error(`命令失败 (exit ${result.code ?? 'unknown'}): ${command}\n${result.stderr}`);
   }
   return result.stdout.trim();
 }
@@ -81,9 +81,9 @@ export async function runRemoteSilent(ssh, command) {
 // 静默执行 + 失败抛错：用于"必须成功"的步骤（如安装、启动）。
 export async function runRemoteStrict(ssh, command) {
   const result = await runRemoteSilent(ssh, command);
-  if (result.code !== 0 && result.code !== null) {
+  if (result.code !== 0) {
     const tail = (result.stderr || result.stdout || '').split('\n').slice(-6).join('\n');
-    throw new Error(`命令失败 (exit ${result.code})\n${tail}`);
+    throw new Error(`命令失败 (exit ${result.code ?? 'unknown'})\n${tail}`);
   }
   return result;
 }
@@ -94,31 +94,51 @@ export async function runRemoteStrict(ssh, command) {
 export async function uploadDirectory(ssh, localPath, remotePath, options = {}) {
   const {
     uploadEnv = false,
-    skipPatterns = ['node_modules', '.git', 'dist', '__pycache__', '.DS_Store', '.venv', 'venv'],
+    skipPatterns = ['node_modules', '.git', '__pycache__', '.DS_Store', '.venv', 'venv'],
   } = options;
 
-  // 非 root 登录时，SFTP 以登录用户身份写入，需先把目标目录授权给该用户
+  const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  const stagingPath = `${remotePath}.deploy-helper-upload-${Date.now()}`;
+  const remoteArg = shellQuote(remotePath);
+  const stagingArg = shellQuote(stagingPath);
+
+  // 先上传到独立临时目录。全部成功后再 rsync，避免半上传状态直接覆盖线上代码。
+  await runRemoteStrict(ssh, `rm -rf ${stagingArg} && mkdir -p ${stagingArg}`);
   if (ssh.__useSudo && ssh.__loginUser) {
-    await runRemoteSilent(ssh, `mkdir -p ${remotePath} && chown -R ${ssh.__loginUser} ${remotePath}`);
+    await runRemoteStrict(ssh, `chown -R ${shellQuote(ssh.__loginUser)} ${stagingArg}`);
   }
 
-  const alwaysSkip = new Set(skipPatterns);
+  const alwaysSkip = new Set([...skipPatterns, '.deploy-config.json']);
   const failed = [];
 
-  await ssh.putDirectory(localPath, remotePath, {
-    recursive: true,
-    concurrency: 5,
-    validate: (itemPath) => {
-      const base = itemPath.split(/[\\/]/).pop();
-      if (alwaysSkip.has(base)) return false;
-      if (base === '.env' && !uploadEnv) return false;
-      return true;
-    },
-    tick: (localFile, remoteFile, error) => {
-      if (error) failed.push(localFile);
-    },
-  });
-  if (failed.length > 0) {
-    console.log(chalk.yellow(`  ⚠ 以下文件上传失败：${failed.join(', ')}`));
+  try {
+    const uploaded = await ssh.putDirectory(localPath, stagingPath, {
+      recursive: true,
+      concurrency: 5,
+      validate: (itemPath) => {
+        const base = itemPath.split(/[\\/]/).pop();
+        if (alwaysSkip.has(base)) return false;
+        if (base === '.env' && !uploadEnv) return false;
+        return true;
+      },
+      tick: (localFile, remoteFile, error) => {
+        if (error) failed.push(localFile);
+      },
+    });
+
+    if (!uploaded || failed.length > 0) {
+      const detail = failed.length > 0 ? `：${failed.slice(0, 5).join(', ')}` : '';
+      throw new Error(`项目文件上传不完整${detail}`);
+    }
+
+    const excludes = [...alwaysSkip];
+    if (!uploadEnv) excludes.push('.env');
+    const excludeArgs = excludes.map((pattern) => `--exclude=${shellQuote(pattern)}`).join(' ');
+    await runRemoteStrict(
+      ssh,
+      `mkdir -p ${remoteArg} && rsync -a --delete ${excludeArgs} ${stagingArg}/ ${remoteArg}/`
+    );
+  } finally {
+    await runRemoteSilent(ssh, `rm -rf ${stagingArg}`);
   }
 }

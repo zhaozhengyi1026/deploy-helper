@@ -1,9 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import inquirer from 'inquirer';
 
-const CONFIG_DIR = path.join(os.homedir(), '.deploy-helper');
 const CONFIG_FILENAME = '.deploy-config.json';
 const CONFIG_FILE = path.join(process.cwd(), CONFIG_FILENAME);
 
@@ -13,27 +11,74 @@ function stripCredentials(config) {
   delete clone.password;
   if (clone.database) delete clone.database.password;
   if (Array.isArray(clone.servers)) {
-    clone.servers.forEach((s) => { delete s.password; });
+    clone.servers.forEach((s) => {
+      delete s.password;
+      delete s.servers;
+    });
   }
   return clone;
 }
 
 export function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(stripCredentials(config), null, 2));
+  try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* Windows may not apply POSIX modes. */ }
   ensureGitignored();
 }
 
 export function loadConfig() {
   if (!fs.existsSync(CONFIG_FILE)) return null;
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+    return migrateConfig(JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')));
   } catch {
     return null;
   }
 }
 
+export function migrateConfig(input) {
+  const config = JSON.parse(JSON.stringify(input));
+  // 0.2.x 曾把 SSH 端口与应用端口共用为 port。旧文件无法还原自定义 SSH
+  // 端口，因此按最安全、最常见的 SSH 22 迁移，并保留旧值作为应用端口。
+  if (!config.schemaVersion && config.projectType && !config.appPort) {
+    config.appPort = config.port;
+    config.sshPort = config.sshPort || 22;
+    config.port = config.sshPort;
+  }
+  if (!config.schemaVersion && config.projectType) config.schemaVersion = 2;
+  return config;
+}
+
 export function configExists() {
   return fs.existsSync(CONFIG_FILE);
+}
+
+export async function selectServer(config, purpose = '执行此操作') {
+  const serverList = Array.isArray(config?.servers) ? config.servers : [];
+  let selected = config;
+
+  if (serverList.length === 1) {
+    selected = serverList[0];
+  } else if (serverList.length > 1) {
+    const { selectedIndex } = await inquirer.prompt([{
+      type: 'list',
+      name: 'selectedIndex',
+      message: `${purpose}，请选择目标服务器：`,
+      choices: serverList.map((server, index) => ({
+        name: `${server.label || server.host} (${server.user}@${server.host}:${server.port || 22})`,
+        value: index,
+      })),
+    }]);
+    selected = serverList[selectedIndex];
+  }
+
+  const { servers: ignoredSelectedServers, ...serverConfig } = selected || {};
+  const { servers: ignoredRootServers, ...sharedConfig } = config || {};
+  const result = { ...sharedConfig, ...serverConfig };
+  result.sshPort = selected && selected !== config
+    ? (selected.sshPort || selected.port || sharedConfig.sshPort || 22)
+    : (result.sshPort || result.port || 22);
+  result.port = result.sshPort;
+  Object.defineProperty(result, '__rootConfig', { value: config, enumerable: false });
+  return result;
 }
 
 /**
@@ -57,6 +102,13 @@ export async function resolveCredentials(config, { needDatabase = false } = {}) 
   if (Array.isArray(config.servers)) {
     for (const s of config.servers) {
       if (s.authType === 'password' && !s.password) {
+        const isRootServer = s.host === config.host
+          && String(s.sshPort || s.port || 22) === String(config.sshPort || config.port || 22)
+          && s.user === config.user;
+        if (isRootServer && config.password) {
+          s.password = config.password;
+          continue;
+        }
         const { pwd } = await inquirer.prompt([{
           type: 'password', name: 'pwd', mask: '*',
           message: `服务器 ${s.label || s.host} 的登录密码：`,

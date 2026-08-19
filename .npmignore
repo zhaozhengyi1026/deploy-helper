@@ -2,5 +2,8 @@
 .git/
 .gitignore
 *.local.json
+.deploy-progress.json
+.deploy-progress.json.tmp
 article.md
 low-alt_eco_3/
+npm步骤.md

@@ -1,41 +1,50 @@
 // shell heredoc：用单引号 EOF 防止 $/反引号/% 被解释，正文本身 single-quote 也安全
 function writeFileHeredoc(remotePath, content) {
-  // 使用唯一 sentinel 避免与正文冲突
-  const sentinel = 'DEPLOY_HELPER_EOF';
-  return `cat > ${remotePath} <<'${sentinel}'\n${content}\n${sentinel}`;
+  // Base64 传输避免启动命令、Nginx 配置等内容与 shell 引号或 heredoc 标记冲突。
+  const encoded = Buffer.from(content, 'utf-8').toString('base64');
+  const quotedPath = `'${String(remotePath).replace(/'/g, `'\\''`)}'`;
+  return `printf '%s' '${encoded}' | base64 -d > ${quotedPath}`;
 }
 
 // 返回在服务器上执行的 shell 命令数组
 export function getSetupCommands(config) {
-  const { projectType, nodeVersion = '20', pythonVersion = '3.11', appMode = 'web' } = config;
+  const { projectType, nodeVersion = '20', pythonVersion = '3.11', appMode = 'web', buildCmd } = config;
   const steps = [];
 
   steps.push({
     label: '更新系统包',
     cmd: 'apt-get update -qq',
   });
+  steps.push({
+    label: '安装基础工具',
+    cmd: `apt-get install -y -qq rsync curl ca-certificates${config.sourceMode === 'git' ? ' git' : ''}`,
+  });
 
   // Nginx 和 Certbot 只有 web 服务需要
-  if (appMode === 'web') {
+  if (appMode === 'web' && config.configureNginx !== false) {
     steps.push({
       label: '安装 Nginx',
       cmd: 'apt-get install -y -qq nginx',
     });
-    steps.push({
-      label: '安装 Certbot（用于 HTTPS）',
-      cmd: 'apt-get install -y -qq certbot python3-certbot-nginx',
-    });
+    if (config.useHttps) {
+      steps.push({
+        label: '安装 Certbot（用于 HTTPS）',
+        cmd: 'apt-get install -y -qq certbot python3-certbot-nginx',
+      });
+    }
   }
 
-  if (projectType === 'nodejs') {
+  if (projectType === 'nodejs' || (projectType === 'static' && buildCmd)) {
     steps.push({
       label: `安装 Node.js ${nodeVersion}`,
-      cmd: `command -v node >/dev/null 2>&1 && node -v | grep -q "^v${nodeVersion}\\." || (curl -fsSL https://deb.nodesource.com/setup_${nodeVersion}.x | bash - && apt-get install -y nodejs)`,
+      cmd: `command -v node >/dev/null 2>&1 && node -v | grep -q "^v${nodeVersion}\\." || (curl -fsSL https://deb.nodesource.com/setup_${nodeVersion}.x -o /tmp/nodesource-setup.sh && bash /tmp/nodesource-setup.sh && rm -f /tmp/nodesource-setup.sh && apt-get install -y nodejs)`,
     });
-    steps.push({
-      label: '安装 PM2（进程管理器）',
-      cmd: 'command -v pm2 >/dev/null 2>&1 || npm install -g pm2',
-    });
+    if (projectType === 'nodejs' && appMode !== 'cron') {
+      steps.push({
+        label: '安装 PM2（进程管理器）',
+        cmd: 'command -v pm2 >/dev/null 2>&1 || npm install -g pm2',
+      });
+    }
   }
 
   if (projectType === 'python') {
@@ -47,7 +56,8 @@ export function getSetupCommands(config) {
         label: '安装 Miniconda（如未安装）',
         cmd: [
           'command -v /opt/miniconda3/bin/conda >/dev/null 2>&1 || (',
-          '  curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh &&',
+          '  ARCH=$(uname -m) && case "$ARCH" in x86_64|aarch64) ;; *) echo "不支持的 CPU 架构: $ARCH" >&2; exit 1;; esac &&',
+          '  curl -fsSL "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${ARCH}.sh" -o /tmp/miniconda.sh &&',
           '  bash /tmp/miniconda.sh -b -p /opt/miniconda3 &&',
           '  rm /tmp/miniconda.sh',
           ')',
@@ -83,7 +93,7 @@ export function getSetupCommands(config) {
     // Docker 可能已预装（云服务商镜像常见），先检查再安装
     steps.push({
       label: '检查/安装 Docker',
-      cmd: `command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh`,
+      cmd: 'command -v docker >/dev/null 2>&1 || (curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh && rm -f /tmp/get-docker.sh)',
     });
     steps.push({
       label: '检查/安装 docker-compose-plugin',
@@ -109,61 +119,70 @@ export function getSetupCommands(config) {
 function buildCronEntry(appName, schedule, fullCmd) {
   const marker = `deploy-helper:${appName}`;
   const logFile = `/var/log/${appName}.log`;
-  // 注意：crontab 行本身不能有未转义的 % —— 这里 grep -v 用 marker 去重
-  // fullCmd 中如有 % 由调用方负责（typical 启动命令不会有）
-  return `(crontab -l 2>/dev/null | grep -v "${marker}"; echo "# ${marker}"; echo "${schedule} ${fullCmd} >> ${logFile} 2>&1") | crontab -`;
+  const shellQuote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  const cronLine = `${schedule} ${fullCmd.replace(/%/g, '\\%')} >> ${logFile} 2>&1`;
+  return `(crontab -l 2>/dev/null | grep -v "${marker}"; printf '%s\\n' ${shellQuote(`# ${marker}`)}; printf '%s\\n' ${shellQuote(cronLine)}) | crontab -`;
+}
+
+function withProjectEnvironment(remotePath, command) {
+  return `cd ${remotePath} && set -a && if [ -f .env ]; then . ./.env; fi && set +a && ${command}`;
+}
+
+function getStartScriptStep(remotePath, command) {
+  const startScript = `${remotePath}/.start.sh`;
+  const content = `#!/bin/bash\nset -e\ncd ${remotePath}\nset -a\nif [ -f .env ]; then . ./.env; fi\nset +a\nexec ${command}\n`;
+  return {
+    path: startScript,
+    step: { label: '写入启动脚本', cmd: `${writeFileHeredoc(startScript, content)} && chmod 700 ${startScript}` },
+  };
 }
 
 // 启动/重启应用的命令
 export function getStartCommands(config) {
   const {
-    projectType, remotePath, startCmd, appName, port,
+    projectType, remotePath, startCmd, appName,
     pythonVersion = '3.11', pythonFramework, pythonEnvManager = 'pip',
-    appMode = 'web', cronSchedule, composeFile,
+    appMode = 'web', cronSchedule, composeFile, buildCmd = '',
   } = config;
+  const port = config.appPort || config.port;
 
   if (projectType === 'nodejs') {
-    const isNpmCmd = /^npm\s/.test(startCmd);
-    const steps = [
-      { label: '安装依赖', cmd: `cd ${remotePath} && npm install --omit=dev` },
-    ];
+    const installCmd = buildCmd
+      ? 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+      : 'if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi';
+    const steps = [{ label: '安装依赖', cmd: `cd ${remotePath} && ${installCmd}` }];
+    if (buildCmd) {
+      steps.push(
+        { label: '构建应用', cmd: `cd ${remotePath} && ${buildCmd}` },
+        { label: '移除仅构建期依赖', cmd: `cd ${remotePath} && npm prune --omit=dev` },
+      );
+    }
 
     if (appMode === 'cron') {
-      const cronFullCmd = `cd ${remotePath} && ${startCmd}`;
+      const cronFullCmd = withProjectEnvironment(remotePath, startCmd);
       steps.push({
         label: '写入定时任务（crontab）',
         cmd: buildCronEntry(appName, cronSchedule, cronFullCmd),
       });
       steps.push({
         label: '立即执行一次（验证）',
-        cmd: `${cronFullCmd} >> /var/log/${appName}.log 2>&1 || true`,
+        cmd: `${cronFullCmd} >> /var/log/${appName}.log 2>&1`,
       });
       return steps;
     }
 
-    // 非 npm 命令通过 .start.sh 包装；npm 命令用 pm2 start npm -- ...
-    const startScript = `${remotePath}/.start.sh`;
-    const startScriptContent = `#!/bin/bash\ncd ${remotePath}\nexec ${startCmd}\n`;
+    const start = getStartScriptStep(remotePath, startCmd);
+    steps.push(start.step);
+    const pm2Target = `${start.path} --name ${appName} --interpreter bash`;
 
-    if (!isNpmCmd) {
-      steps.push({
-        label: '写入启动脚本',
-        cmd: `${writeFileHeredoc(startScript, startScriptContent)} && chmod +x ${startScript}`,
-      });
-    }
-
-    const pm2Target = isNpmCmd
-      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
-      : `${startScript} --name ${appName} --interpreter bash`;
-
-    // script 模式不自动重启；web 模式正常重启
+    // script 模式正常退出不重启，异常退出仍由 PM2 拉起。
     const pm2StartCmd = appMode === 'script'
-      ? `pm2 delete ${appName} 2>/dev/null || true; pm2 start ${pm2Target} --no-autorestart`
+      ? `pm2 delete ${appName} 2>/dev/null || true; pm2 start ${pm2Target} --stop-exit-codes 0`
       : `pm2 delete ${appName} 2>/dev/null || true; pm2 start ${pm2Target}`;
 
     steps.push(
-      { label: `启动应用（PM2${appMode === 'script' ? '，不自动重启' : ''}）`, cmd: pm2StartCmd },
-      { label: '设置 PM2 开机自启', cmd: `pm2 save && (pm2 startup | tail -1 | bash || true)` },
+      { label: `启动应用（PM2${appMode === 'script' ? '，异常退出时重启' : ''}）`, cmd: pm2StartCmd },
+      { label: '设置 PM2 开机自启', cmd: 'pm2 startup systemd -u root --hp /root >/dev/null && pm2 save' },
     );
 
     return steps;
@@ -190,21 +209,23 @@ export function getStartCommands(config) {
           ...installSteps,
           {
             label: '写入定时任务（crontab）',
-            cmd: buildCronEntry(appName, cronSchedule, condaCmd),
+            cmd: buildCronEntry(appName, cronSchedule, withProjectEnvironment(remotePath, condaCmd)),
           },
           {
             label: '立即执行一次（验证）',
-            cmd: `${condaCmd} >> /var/log/${appName}.log 2>&1 || true`,
+            cmd: `${withProjectEnvironment(remotePath, condaCmd)} >> /var/log/${appName}.log 2>&1`,
           },
         ];
       }
 
+      const start = getStartScriptStep(remotePath, condaCmd);
       const supervisorConf = getSupervisorConfig({
-        appName, remotePath, venvCmd: condaCmd,
+        appName, remotePath, venvCmd: `/bin/bash ${start.path}`,
         autorestart: appMode === 'script' ? 'unexpected' : 'true',
       });
       return [
         ...installSteps,
+        start.step,
         {
           label: '写入 supervisor 配置',
           cmd: writeFileHeredoc(supervisorConfPath, supervisorConf),
@@ -220,6 +241,9 @@ export function getStartCommands(config) {
     const pyBin = `python${pythonVersion}`;
     const venvPip = `${remotePath}/venv/bin/pip`;
     const venvCmd = startCmd.replace(/^(\S+)/, `${remotePath}/venv/bin/$1`);
+    const dependencyInstall = config.pythonDependencySource === 'pyproject'
+      ? `${venvPip} install ${remotePath} -q`
+      : `${venvPip} install -r ${remotePath}/requirements.txt -q`;
 
     const installSteps = [
       {
@@ -228,7 +252,7 @@ export function getStartCommands(config) {
       },
       {
         label: '安装 Python 依赖',
-        cmd: `cd ${remotePath} && ${venvPip} install -r requirements.txt -q`,
+        cmd: dependencyInstall,
       },
     ];
 
@@ -245,21 +269,23 @@ export function getStartCommands(config) {
         ...installSteps,
         {
           label: '写入定时任务（crontab）',
-          cmd: buildCronEntry(appName, cronSchedule, `cd ${remotePath} && ${venvCmd}`),
+          cmd: buildCronEntry(appName, cronSchedule, withProjectEnvironment(remotePath, venvCmd)),
         },
         {
           label: '立即执行一次（验证）',
-          cmd: `cd ${remotePath} && ${venvCmd} >> /var/log/${appName}.log 2>&1 || true`,
+          cmd: `${withProjectEnvironment(remotePath, venvCmd)} >> /var/log/${appName}.log 2>&1`,
         },
       ];
     }
 
+    const start = getStartScriptStep(remotePath, venvCmd);
     const supervisorConf = getSupervisorConfig({
-      appName, remotePath, venvCmd,
+      appName, remotePath, venvCmd: `/bin/bash ${start.path}`,
       autorestart: appMode === 'script' ? 'unexpected' : 'true',
     });
     return [
       ...installSteps,
+      start.step,
       {
         label: '写入 supervisor 配置',
         cmd: writeFileHeredoc(supervisorConfPath, supervisorConf),
@@ -295,18 +321,29 @@ export function getStartCommands(config) {
       {
         label: '启动容器',
         cmd: [
-          `docker stop ${appName} 2>/dev/null || true`,
-          `docker rm ${appName} 2>/dev/null || true`,
-          `docker run -d --name ${appName} --restart unless-stopped -p ${port}:${port} ${appName}`,
+          `(docker stop ${appName} 2>/dev/null || true)`,
+          `(docker rm ${appName} 2>/dev/null || true)`,
+          `ENV_ARGS=""; [ -f ${remotePath}/.env ] && ENV_ARGS="--env-file ${remotePath}/.env" || true; docker run -d --name ${appName} --restart unless-stopped -p ${port}:${port} $ENV_ARGS ${appName}`,
         ].join(' && '),
       },
     ];
   }
 
   if (projectType === 'static') {
-    return [
-      { label: '设置 Nginx 文件权限', cmd: `chown -R www-data:www-data ${remotePath}` },
-    ];
+    const cleanDir = (config.staticDir || '').trim().replace(/^\/+|\/+$/g, '');
+    const webRoot = cleanDir ? `${remotePath}/${cleanDir}` : remotePath;
+    const steps = [];
+    if (buildCmd) {
+      steps.push(
+        { label: '安装构建依赖', cmd: `cd ${remotePath} && if [ -f package-lock.json ]; then npm ci; else npm install; fi` },
+        { label: '构建静态站点', cmd: `cd ${remotePath} && ${buildCmd}` },
+      );
+    }
+    steps.push(
+      { label: '验证站点目录', cmd: `test -d ${webRoot} && test -f ${webRoot}/index.html` },
+      { label: '设置 Nginx 文件权限', cmd: `chown -R www-data:www-data ${webRoot}` },
+    );
+    return steps;
   }
 
   return [];
@@ -415,12 +452,42 @@ export function getHealthCheck(config) {
     };
   }
 
-  // static 没有进程，认为只要 Nginx 在跑即可
+  if (projectType === 'static' && config.configureNginx === false) {
+    const siteRoot = config.staticDir ? `${remotePath}/${config.staticDir}` : remotePath;
+    return {
+      cmd: `test -f '${siteRoot}/index.html' && echo ready || true`,
+      parse: ({ stdout }) => stdout.trim() === 'ready'
+        ? { ok: true, detail: '站点文件已生成（未配置 Web 入口）' }
+        : { ok: false, detail: '没有找到 index.html' },
+    };
+  }
+
+  // static 没有进程，配置域名时检查 Nginx。
   return {
     cmd: `systemctl is-active nginx 2>/dev/null || true`,
     parse: ({ stdout }) => stdout.trim() === 'active'
       ? { ok: true, detail: 'Nginx active' }
       : { ok: false, detail: `Nginx 状态: ${stdout.trim()}` },
+  };
+}
+
+export function getHttpHealthCheck(config) {
+  if ((config.appMode || 'web') !== 'web') return null;
+  if (config.projectType === 'static' && config.configureNginx === false) return null;
+  const host = String(config.domain || config.host || 'localhost').replace(/'/g, '');
+  const directPort = config.appPort || config.port || 80;
+  const request = config.configureNginx === false
+    ? `curl --max-time 10 -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:${directPort}/ || true`
+    : config.useHttps
+    ? `curl --max-time 10 --resolve '${host}:443:127.0.0.1' -sS -o /dev/null -w '%{http_code}' https://${host}/ || true`
+    : `curl --max-time 10 -sS -o /dev/null -w '%{http_code}' -H 'Host: ${host}' http://127.0.0.1/ || true`;
+  return {
+    cmd: request,
+    parse: ({ stdout }) => {
+      const status = Number(String(stdout).trim());
+      if (status >= 200 && status < 500) return { ok: true, detail: `HTTP ${status}` };
+      return { ok: false, detail: status ? `HTTP ${status}` : '无法连接本机 HTTP 服务' };
+    },
   };
 }
 
@@ -441,7 +508,8 @@ function getSupervisorConfig({ appName, remotePath, venvCmd, autorestart = 'true
 
 // 生成 Nginx 配置
 export function getNginxConfig(config) {
-  const { domain, port, projectType, remotePath, staticDir } = config;
+  const { domain, projectType, remotePath, staticDir } = config;
+  const port = config.appPort || config.port;
 
   if (projectType === 'static') {
     // staticDir 指向构建产物子目录（如 dist），留空则用项目根
@@ -475,10 +543,11 @@ export function getNginxConfig(config) {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_cache_bypass $http_upgrade;
     }
 }`;
 }
 
-// 把任意字符串内容写入服务器文件的 shell 命令（heredoc 方式）
+// 把任意字符串内容安全写入服务器文件
 export { writeFileHeredoc };

@@ -3,8 +3,9 @@ import ora from 'ora';
 import inquirer from 'inquirer';
 import fs from 'fs';
 import path from 'path';
-import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig, resolveCredentials } from '../utils/config.js';
+import { connectSSH, runRemoteSilent, runRemoteStrict } from '../utils/ssh.js';
+import { loadConfig, resolveCredentials, selectServer } from '../utils/config.js';
+import { getStartCommands } from '../utils/setup.js';
 
 const ENV_BACKUP_DIR = '/var/deploy-helper/env-backups';
 
@@ -19,7 +20,7 @@ function parseEnvFile(content) {
     .map(({ line, num }) => {
       const eqIdx = line.indexOf('=');
       if (eqIdx === -1) return null;
-      const key = line.slice(0, eqIdx).trim();
+      const key = line.slice(0, eqIdx).trim().replace(/^export\s+/, '');
       const value = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
       return { key, value, num };
     })
@@ -32,9 +33,9 @@ function parseEnvFile(content) {
 function previewEnv(vars) {
   console.log(chalk.bold('\n  .env 文件内容预览：\n'));
   vars.forEach(({ key, value }) => {
-    const isSensitive = /secret|password|key|token|pwd|pass/i.test(key);
+    const isSensitive = /secret|password|key|token|pwd|pass|credential|auth|cookie|session|private|dsn|url|uri/i.test(key);
     const displayVal = isSensitive
-      ? chalk.gray(value.slice(0, 3) + '***' + value.slice(-2))
+      ? chalk.gray(`<已隐藏，${value.length} 个字符>`)
       : chalk.gray(value.length > 40 ? value.slice(0, 40) + '...' : value);
     console.log(`    ${chalk.cyan(key)}=${displayVal}`);
   });
@@ -42,12 +43,13 @@ function previewEnv(vars) {
 }
 
 export async function deployEnv() {
-  const config = loadConfig();
+  let config = loadConfig();
   if (!config) {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
 
+  config = await selectServer(config, '管理环境变量');
   await resolveCredentials(config);
 
   // 检查本地 .env 是否存在
@@ -114,24 +116,21 @@ async function pushEnv(config, envContent, vars) {
   try {
     // 备份服务器现有 .env
     const backupSpinner = ora('备份服务器现有 .env...').start();
-    await runRemoteSilent(ssh, `mkdir -p ${ENV_BACKUP_DIR}`);
+    await runRemoteStrict(ssh, `mkdir -p ${ENV_BACKUP_DIR} && chmod 700 ${ENV_BACKUP_DIR}`);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    await runRemoteSilent(
-      ssh,
-      `[ -f ${config.remotePath}/.env ] && cp ${config.remotePath}/.env ${ENV_BACKUP_DIR}/.env_${config.appName}_${timestamp} || true`
-    );
-    backupSpinner.succeed('已备份旧 .env');
+    const oldEnv = await runRemoteSilent(ssh, `test -f ${config.remotePath}/.env`);
+    if (oldEnv.code === 0) {
+      await runRemoteStrict(ssh, `cp ${config.remotePath}/.env ${ENV_BACKUP_DIR}/.env_${config.appName}_${timestamp}`);
+      backupSpinner.succeed('已备份旧 .env');
+    } else {
+      backupSpinner.info('服务器上没有旧 .env，跳过备份');
+    }
 
     // 上传新 .env：base64 编码后在服务器解码，彻底避开 shell 转义/heredoc sentinel 问题
     const uploadSpinner = ora('上传 .env 到服务器...').start();
     const b64 = Buffer.from(envContent, 'utf-8').toString('base64');
-    const writeResult = await runRemoteSilent(ssh, `echo '${b64}' | base64 -d > ${config.remotePath}/.env`);
-    if (writeResult.code !== 0) {
-      uploadSpinner.fail('上传失败：' + (writeResult.stderr || '写入 .env 出错'));
-      ssh.dispose();
-      return;
-    }
-    await runRemoteSilent(ssh, `chmod 600 ${config.remotePath}/.env`);
+    await runRemoteStrict(ssh, `echo '${b64}' | base64 -d > ${config.remotePath}/.env`);
+    await runRemoteStrict(ssh, `chmod 600 ${config.remotePath}/.env`);
     uploadSpinner.succeed('.env 上传完成，权限已设为 600');
 
     // cron 模式不需要重启（下次定时使用新环境变量）
@@ -148,18 +147,25 @@ async function pushEnv(config, envContent, vars) {
 
       if (restart) {
         const restartSpinner = ora('重启服务...').start();
-        if (config.projectType === 'nodejs') {
-          await runRemoteSilent(ssh, `pm2 restart ${config.appName}`);
-        } else if (config.projectType === 'python') {
-          await runRemoteSilent(ssh, `supervisorctl restart ${config.appName}`);
-        } else if (config.projectType === 'docker') {
-          if (config.composeFile) {
-            await runRemoteSilent(ssh, `cd ${config.remotePath} && docker compose -f ${config.composeFile} up -d`);
-          } else {
-            await runRemoteSilent(ssh, `docker restart ${config.appName}`);
+        try {
+          if (config.projectType === 'nodejs') {
+            await runRemoteStrict(ssh, `pm2 restart ${config.appName}`);
+          } else if (config.projectType === 'python') {
+            await runRemoteStrict(ssh, `supervisorctl restart ${config.appName}`);
+          } else if (config.projectType === 'docker') {
+            if (config.composeFile) {
+              await runRemoteStrict(ssh, `cd ${config.remotePath} && docker compose -f ${config.composeFile} up -d --force-recreate`);
+            } else {
+              const startContainer = getStartCommands(config).find(step => step.label === '启动容器');
+              if (!startContainer) throw new Error('无法生成 Docker 容器重建命令');
+              await runRemoteStrict(ssh, startContainer.cmd);
+            }
           }
+          restartSpinner.succeed('服务已重启');
+        } catch (err) {
+          restartSpinner.fail('服务重启失败');
+          throw err;
         }
-        restartSpinner.succeed('服务已重启');
       }
     }
 
@@ -167,12 +173,23 @@ async function pushEnv(config, envContent, vars) {
     console.log(chalk.green.bold('\n✅ .env 同步完成！\n'));
 
   } catch (err) {
-    console.log(chalk.red('\n上传失败：' + err.message));
+    console.log(chalk.red('\n环境变量同步失败：' + err.message));
     ssh.dispose();
   }
 }
 
 async function pullEnv(config) {
+  const localEnvPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(localEnvPath)) {
+    const { overwrite } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'overwrite',
+      message: '本地已有 .env，确认覆盖？',
+      default: false,
+    }]);
+    if (!overwrite) return;
+  }
+
   let ssh;
   const spinner = ora('连接服务器...').start();
   try {
@@ -184,26 +201,15 @@ async function pullEnv(config) {
   }
 
   try {
-    const result = await runRemoteSilent(ssh, `cat ${config.remotePath}/.env 2>/dev/null || echo ""`);
-    ssh.dispose();
-
-    if (!result.stdout.trim()) {
+    const exists = await runRemoteSilent(ssh, `test -f ${config.remotePath}/.env`);
+    if (exists.code !== 0) {
       console.log(chalk.yellow('\n服务器上没有 .env 文件。\n'));
+      ssh.dispose();
       return;
     }
-
-    const localEnvPath = path.join(process.cwd(), '.env');
-    if (fs.existsSync(localEnvPath)) {
-      const { overwrite } = await inquirer.prompt([{
-        type: 'confirm',
-        name: 'overwrite',
-        message: '本地已有 .env，确认覆盖？',
-        default: false,
-      }]);
-      if (!overwrite) return;
-    }
-
-    fs.writeFileSync(localEnvPath, result.stdout);
+    await ssh.getFile(localEnvPath, `${config.remotePath}/.env`);
+    try { fs.chmodSync(localEnvPath, 0o600); } catch { /* Windows may not apply POSIX modes. */ }
+    ssh.dispose();
     console.log(chalk.green.bold('\n✅ 已从服务器拉取 .env 到本地。\n'));
 
   } catch (err) {

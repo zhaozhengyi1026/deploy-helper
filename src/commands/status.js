@@ -1,16 +1,18 @@
 import chalk from 'chalk';
 import ora from 'ora';
 import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig, resolveCredentials } from '../utils/config.js';
+import { loadConfig, resolveCredentials, selectServer } from '../utils/config.js';
+import { getHttpHealthCheck } from '../utils/setup.js';
 
 export async function deployStatus() {
-  const config = loadConfig();
+  let config = loadConfig();
 
   if (!config) {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
 
+  config = await selectServer(config, '查看状态');
   await resolveCredentials(config);
 
   let ssh;
@@ -51,21 +53,42 @@ export async function deployStatus() {
   } else if (config.projectType === 'docker') {
     await showDockerStatus(ssh, config);
   } else if (config.projectType === 'static') {
-    console.log(chalk.gray('    静态站点，无独立进程（由 Nginx 直接托管）'));
+    console.log(chalk.gray(config.configureNginx === false
+      ? '    静态文件已生成，但尚未配置公开访问入口'
+      : '    静态站点，无独立进程（由 Nginx 直接托管）'));
   }
 
   // Nginx 状态（仅 web 服务需要）
-  if (appMode === 'web') {
+  if (appMode === 'web' && config.configureNginx !== false) {
     console.log(chalk.bold('\n  Nginx 状态：'));
     const nginxStatus = await runRemoteSilent(ssh, `systemctl is-active nginx`);
     const isActive = nginxStatus.stdout.trim() === 'active';
     console.log(`  ${isActive ? chalk.green('● 运行中') : chalk.red('✗ 未运行')}`);
 
     // 访问地址
-    const accessUrl = config.useHttps && config.domain
+    const accessUrl = config.configureNginx === false
+      ? `http://${config.host}:${config.appPort || 80}`
+      : config.useHttps && config.domain
       ? `https://${config.domain}`
       : config.domain ? `http://${config.domain}` : `http://${config.host}`;
     console.log(chalk.bold('\n  访问地址：') + chalk.cyan.underline(accessUrl));
+    const httpHealth = getHttpHealthCheck(config);
+    if (httpHealth) {
+      const httpResult = await runRemoteSilent(ssh, httpHealth.cmd);
+      const httpStatus = httpHealth.parse(httpResult);
+      console.log(chalk.gray('  HTTP 检查：') + (httpStatus.ok ? chalk.green(httpStatus.detail) : chalk.red(httpStatus.detail)));
+    }
+  } else if (appMode === 'web' && config.projectType === 'static') {
+    console.log(chalk.yellow('\n  没有配置 Nginx，因此静态文件目前没有公开访问地址。'));
+  } else if (appMode === 'web') {
+    const accessUrl = `http://${config.host}:${config.appPort || 80}`;
+    console.log(chalk.bold('\n  访问地址：') + chalk.cyan.underline(accessUrl));
+    const httpHealth = getHttpHealthCheck(config);
+    if (httpHealth) {
+      const httpResult = await runRemoteSilent(ssh, httpHealth.cmd);
+      const httpStatus = httpHealth.parse(httpResult);
+      console.log(chalk.gray('  HTTP 检查：') + (httpStatus.ok ? chalk.green(httpStatus.detail) : chalk.red(httpStatus.detail)));
+    }
   }
 
   if (config.deployedAt) {
