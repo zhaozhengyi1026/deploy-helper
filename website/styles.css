@@ -26,9 +26,7 @@ button { font: inherit; }
 .skip-link:focus { top: 1rem; }
 
 .site-header { position: relative; z-index: 10; max-width: 1280px; margin: 0 auto; padding: 1.4rem 3rem; display: flex; align-items: center; justify-content: space-between; }
-.brand { display: inline-flex; gap: .65rem; align-items: center; font-weight: 800; text-decoration: none; letter-spacing: -.02em; }
-.brand-mark { display: grid; place-items: center; width: 2.5rem; height: 2.5rem; border: 2px solid var(--ink); border-radius: 50%; font-family: var(--mono); font-size: .78rem; }
-.brand-mark span { color: var(--orange); }
+.brand { display: inline-flex; align-items: center; font-weight: 800; text-decoration: none; letter-spacing: -.02em; }
 nav { display: flex; gap: 2rem; align-items: center; }
 nav a { color: var(--muted); text-decoration: none; font-size: .94rem; font-weight: 700; }
 nav a:hover { color: var(--blue); }
